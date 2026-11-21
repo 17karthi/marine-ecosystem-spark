@@ -1,7 +1,7 @@
 
 import os
 import zipfile
-from functools import lru_cache
+from pathlib import Path
 
 import joblib
 import numpy as np
@@ -14,6 +14,9 @@ st.set_page_config(
     page_icon="🌊",
     layout="wide",
 )
+
+ROOT = Path(__file__).resolve().parent
+ZIP_PATH = ROOT / "models.zip"
 
 FEATURE_COLUMNS = [
     "latitude",
@@ -32,7 +35,51 @@ HYBRIDS = {
     "Hybrid 6 - LR + RF + GBT": ["LR", "RF", "GBT"],
 }
 
-@st.cache_resource
+
+def find_model_directory():
+    """
+    Extract models.zip and locate the actual Spark model folder.
+    Handles ZIPs with or without a top-level models/ directory.
+    """
+    if not ZIP_PATH.is_file():
+        raise FileNotFoundError(
+            f"models.zip was not found at {ZIP_PATH}"
+        )
+
+    extract_dir = ROOT / "_extracted_models"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(ZIP_PATH, "r") as archive:
+        archive.extractall(extract_dir)
+
+    candidates = [
+        extract_dir / "models",
+        extract_dir,
+    ]
+
+    # Also handle an extra parent directory inside the ZIP.
+    candidates.extend(
+        path.parent
+        for path in extract_dir.rglob("preprocessing")
+        if path.is_dir()
+    )
+
+    for candidate in candidates:
+        metadata = candidate / "preprocessing" / "metadata"
+
+        if metadata.is_dir():
+            return candidate
+
+    with zipfile.ZipFile(ZIP_PATH, "r") as archive:
+        entries = archive.namelist()[:25]
+
+    raise FileNotFoundError(
+        "Could not find preprocessing/metadata inside models.zip. "
+        f"First ZIP entries: {entries}"
+    )
+
+
+@st.cache_resource(show_spinner="Starting Apache Spark ML...")
 def load_models():
     from pyspark.sql import SparkSession
     from pyspark.ml import PipelineModel
@@ -44,9 +91,7 @@ def load_models():
         LinearSVCModel,
     )
 
-    if not os.path.exists("models"):
-        with zipfile.ZipFile("models.zip") as archive:
-            archive.extractall(".")
+    model_dir = find_model_directory()
 
     spark = (
         SparkSession.builder
@@ -58,7 +103,9 @@ def load_models():
         .getOrCreate()
     )
 
-    preprocessing = PipelineModel.load("models/preprocessing")
+    preprocessing = PipelineModel.load(
+        str(model_dir / "preprocessing")
+    )
 
     model_classes = {
         "LR": LogisticRegressionModel,
@@ -76,71 +123,84 @@ def load_models():
         "SVM": "base_svm",
     }
 
-    models = {
-        name: cls.load("models/" + model_paths[name])
-        for name, cls in model_classes.items()
-    }
+    models = {}
 
-    calibrator = joblib.load(
-        "models/svm_probability_calibrator.joblib"
+    for name, model_class in model_classes.items():
+        path = model_dir / model_paths[name]
+        models[name] = model_class.load(str(path))
+
+    calibrator_path = (
+        model_dir / "svm_probability_calibrator.joblib"
     )
+
+    calibrator = joblib.load(calibrator_path)
 
     return spark, preprocessing, models, calibrator
 
 
 def predict(values):
     from pyspark.sql.types import (
-        StructType, StructField, DoubleType
+        StructType,
+        StructField,
+        DoubleType,
     )
     from pyspark.ml.functions import vector_to_array
 
     spark, preprocessing, models, calibrator = load_models()
 
     schema = StructType([
-        StructField(name, DoubleType(), False)
-        for name in FEATURE_COLUMNS
+        StructField(column, DoubleType(), False)
+        for column in FEATURE_COLUMNS
     ])
 
-    frame = spark.createDataFrame(
-        [tuple(float(v) for v in values)],
+    input_data = spark.createDataFrame(
+        [tuple(float(value) for value in values)],
         schema=schema,
     )
 
-    transformed = preprocessing.transform(frame)
+    transformed = preprocessing.transform(input_data)
 
     probabilities = {}
 
     for name, model in models.items():
-        result = model.transform(transformed)
+        prediction = model.transform(transformed)
 
         if name == "SVM":
             margin = float(
-                result.select(
-                    vector_to_array("rawPrediction")[1]
-                    .alias("margin")
+                prediction.select(
+                    vector_to_array("rawPrediction")[1].alias(
+                        "margin"
+                    )
                 ).first()["margin"]
             )
-            probabilities[name] = float(
+
+            probability = float(
                 calibrator.predict_proba(
                     np.array([[margin]])
                 )[0, 1]
             )
         else:
-            probabilities[name] = float(
-                result.select(
-                    vector_to_array("probability")[1]
-                    .alias("prob")
-                ).first()["prob"]
+            probability = float(
+                prediction.select(
+                    vector_to_array("probability")[1].alias(
+                        "probability_value"
+                    )
+                ).first()["probability_value"]
             )
 
-    rows = []
+        probabilities[name] = probability
+
+    results = []
 
     for hybrid_name, members in HYBRIDS.items():
-        score = float(np.mean([
-            probabilities[name] for name in members
-        ]))
+        score = float(
+            np.mean([
+                probabilities[member]
+                for member in members
+            ])
+        )
 
-        rows.append({
+        results.append({
             "Hybrid Algorithm": hybrid_name,
             "Oxygen Stress Probability (%)": round(
                 score * 100, 2
@@ -152,87 +212,129 @@ def predict(values):
             ),
         })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(results)
 
+
+# ------------------------------
+# STREAMLIT USER INTERFACE
+# ------------------------------
 
 st.title("🌊 Marine Ecosystem Habitability Prediction")
+
 st.write(
-    "Apache Spark ML | Six Hybrid Ensemble Models"
+    "### Apache Spark ML | Six Hybrid Ensemble Models"
 )
+
 st.info(
-    "Predictions estimate severe oxygen depletion risk "
-    "from ocean profile measurements. They do not directly "
-    "measure species-specific habitability."
+    "This dashboard estimates severe oxygen depletion "
+    "risk using ocean measurements. It does not directly "
+    "predict species-specific marine habitability."
 )
 
-with st.form("marine_form"):
-    col1, col2 = st.columns(2)
+st.divider()
 
-    with col1:
+with st.form("prediction_form"):
+
+    left, right = st.columns(2)
+
+    with left:
         latitude = st.number_input(
-            "Latitude", min_value=-90.0, max_value=90.0,
-            value=8.8342, format="%.4f"
-        )
-        longitude = st.number_input(
-            "Longitude", min_value=-180.0, max_value=180.0,
-            value=134.0848, format="%.4f"
-        )
-        pressure = st.number_input(
-            "Maximum Pressure (dbar)",
-            min_value=0.0, value=4339.0
+            "Latitude",
+            min_value=-90.0,
+            max_value=90.0,
+            value=8.8342,
+            format="%.4f",
         )
 
-    with col2:
-        temperature = st.number_input(
-            "Mean Temperature (°C)",
-            value=4.0279, format="%.4f"
+        longitude = st.number_input(
+            "Longitude",
+            min_value=-180.0,
+            max_value=180.0,
+            value=134.0848,
+            format="%.4f",
         )
-        salinity = st.number_input(
+
+        maximum_pressure = st.number_input(
+            "Maximum Pressure (dbar)",
+            min_value=0.0,
+            value=4339.0,
+        )
+
+    with right:
+        mean_temperature = st.number_input(
+            "Mean Temperature (°C)",
+            value=4.0279,
+            format="%.4f",
+        )
+
+        mean_salinity = st.number_input(
             "Mean Salinity",
-            min_value=0.0, value=34.6102,
-            format="%.4f"
+            min_value=0.0,
+            value=34.6102,
+            format="%.4f",
         )
 
     submitted = st.form_submit_button(
-        "Predict with Apache Spark",
-        use_container_width=True,
+        "🔍 Predict with Apache Spark",
         type="primary",
+        use_container_width=True,
     )
 
+
 if submitted:
-    with st.spinner(
-        "Running six hybrid models using Apache Spark ML..."
-    ):
-        try:
-            results = predict([
-                latitude,
-                longitude,
-                pressure,
-                temperature,
-                salinity,
-            ])
+    values = [
+        latitude,
+        longitude,
+        maximum_pressure,
+        mean_temperature,
+        mean_salinity,
+    ]
 
-            st.success("Spark ML predictions completed!")
-            st.subheader("Six Hybrid Model Predictions")
-            st.dataframe(
-                results,
-                use_container_width=True,
-                hide_index=True,
-            )
+    try:
+        with st.spinner(
+            "Running six hybrid models using Apache Spark ML..."
+        ):
+            results = predict(values)
 
-            fig = px.bar(
-                results,
-                x="Hybrid Algorithm",
-                y="Oxygen Stress Probability (%)",
-                color="Prediction",
-                title="Severe Oxygen Stress Probability",
-                range_y=[0, 100],
-            )
-            st.plotly_chart(fig, use_container_width=True)
+        st.success("Apache Spark ML predictions completed!")
 
-        except Exception as error:
-            st.error(
-                "Spark prediction failed: " + str(error)
-            )
-            st.exception(error)
+        st.subheader("Six Hybrid Model Predictions")
 
+        st.dataframe(
+            results,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.subheader("Prediction Comparison")
+
+        figure = px.bar(
+            results,
+            x="Hybrid Algorithm",
+            y="Oxygen Stress Probability (%)",
+            color="Prediction",
+            title="Severe Oxygen Stress Probability by Hybrid",
+            range_y=[0, 100],
+            text="Oxygen Stress Probability (%)",
+        )
+
+        figure.update_layout(
+            xaxis_title="Hybrid Algorithm",
+            yaxis_title="Oxygen Stress Probability (%)",
+        )
+
+        st.plotly_chart(
+            figure,
+            use_container_width=True,
+        )
+
+        st.caption(
+            "All predictions are calculated using the "
+            "saved Apache Spark ML classification models."
+        )
+
+    except Exception as error:
+        st.error(
+            f"Spark prediction failed: {error}"
+        )
+        st.exception(error)
